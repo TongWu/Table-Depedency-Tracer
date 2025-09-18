@@ -109,6 +109,32 @@ def word_boundary_pattern_fqtn(fqtn: str) -> re.Pattern:
 RE_SAS_MACRO_ASSIGN = re.compile(r"%let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]*);", re.IGNORECASE)
 RE_SAS_INPUT_MACRO = re.compile(r"_input\d*$")
 RE_SAS_OUTPUT_MACRO = re.compile(r"_output\d*$")
+RE_SAS_FQTN_NORMALIZED = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+# Detect inline dataset usage like "from lib.table" or "set &macro".
+RE_SAS_KEYWORD_FQTN = re.compile(
+    r"\b(?:from|join|set|merge)\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+RE_SAS_KEYWORD_MACRO = re.compile(
+    r"\b(?:from|join|set|merge)\s+(&[A-Za-z_][A-Za-z0-9_]*\.?)",
+    re.IGNORECASE,
+)
+RE_SAS_CREATE_TABLE_FQTN = re.compile(
+    r"\bcreate\s+table\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+RE_SAS_CREATE_TABLE_MACRO = re.compile(
+    r"\bcreate\s+table\s+(&[A-Za-z_][A-Za-z0-9_]*\.?)",
+    re.IGNORECASE,
+)
+RE_SAS_DATA_STMT_FQTN = re.compile(
+    r"\bdata\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+RE_SAS_DATA_STMT_MACRO = re.compile(
+    r"\bdata\s+(&[A-Za-z_][A-Za-z0-9_]*\.?)",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_sas_macro_value(value: str) -> str:
@@ -124,9 +150,55 @@ def _normalize_sas_dataset(value: str) -> str:
     """Return dataset reference without trailing punctuation."""
 
     v = value.strip()
+
+    # Strip simple macro function wrappers like %nrquote(...)
+    while True:
+        m = re.match(r"^%[A-Za-z_][A-Za-z0-9_]*\((.*)\)$", v)
+        if m:
+            v = m.group(1).strip()
+            continue
+        break
+
+    # Remove surrounding quotes again in case wrapper introduced them
+    if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+        v = v[1:-1].strip()
+
+    # Drop balanced outer parentheses
+    while v.startswith("(") and v.endswith(")"):
+        v = v[1:-1].strip()
+
     v = v.rstrip(";,)")
     v = v.lstrip("(")
     return v.strip()
+
+
+def _resolve_sas_dataset_token(token: str, macros: Dict[str, str]) -> Optional[str]:
+    """Resolve a SAS dataset token or macro reference to a normalized FQTN."""
+
+    cleaned = token.strip().strip("'\"")
+    cleaned = cleaned.lstrip("(").rstrip(",);")
+    while cleaned.endswith('.'):
+        cleaned = cleaned[:-1]
+    if not cleaned:
+        return None
+
+    if cleaned.startswith('&'):
+        macro_name = cleaned[1:]
+        while macro_name.endswith('.'):
+            macro_name = macro_name[:-1]
+        value = macros.get(macro_name.lower())
+        if not value:
+            return None
+        dataset = _normalize_sas_dataset(value)
+    else:
+        dataset = _normalize_sas_dataset(cleaned)
+
+    if not dataset:
+        return None
+    norm = normalize_fqtn(dataset)
+    if not norm:
+        return None
+    return norm if RE_SAS_FQTN_NORMALIZED.fullmatch(norm) else None
 
 
 def parse_sas_macros(text: str) -> Dict[str, str]:
@@ -152,12 +224,39 @@ def extract_sas_lineage(text: str) -> Tuple[Set[str], Set[str]]:
         if not dataset:
             continue
         norm = normalize_fqtn(dataset)
-        if not norm:
+        if not norm or not RE_SAS_FQTN_NORMALIZED.fullmatch(norm):
             continue
         if RE_SAS_INPUT_MACRO.fullmatch(name):
             inputs.add(norm)
         elif RE_SAS_OUTPUT_MACRO.fullmatch(name):
             outputs.add(norm)
+
+    # Capture outputs declared inline (CREATE TABLE / DATA statements).
+    for db, tbl in RE_SAS_CREATE_TABLE_FQTN.findall(text):
+        outputs.add(to_fqtn(db, tbl))
+    for db, tbl in RE_SAS_DATA_STMT_FQTN.findall(text):
+        outputs.add(to_fqtn(db, tbl))
+    for macro_ref in RE_SAS_CREATE_TABLE_MACRO.findall(text):
+        norm = _resolve_sas_dataset_token(macro_ref, macros)
+        if norm:
+            outputs.add(norm)
+    for macro_ref in RE_SAS_DATA_STMT_MACRO.findall(text):
+        norm = _resolve_sas_dataset_token(macro_ref, macros)
+        if norm:
+            outputs.add(norm)
+
+    # Capture inline dataset references (both literal FQTN and macro-driven).
+    for db, tbl in RE_SAS_KEYWORD_FQTN.findall(text):
+        norm = to_fqtn(db, tbl)
+        inputs.add(norm)
+
+    for macro_ref in RE_SAS_KEYWORD_MACRO.findall(text):
+        norm = _resolve_sas_dataset_token(macro_ref, macros)
+        if norm:
+            inputs.add(norm)
+
+    # Drop any inputs that are also outputs of this job to avoid self-loops.
+    inputs -= outputs
 
     return inputs, outputs
 

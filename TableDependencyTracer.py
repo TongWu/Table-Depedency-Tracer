@@ -21,6 +21,7 @@ Author: Wu Tong
 """
 
 import argparse
+import ast
 import logging
 import os
 import re
@@ -222,6 +223,156 @@ def parse_output_tables_from_header(text: str) -> Set[str]:
     return out
 
 
+def _collect_attr_chain(node: ast.AST) -> List[str]:
+    """Return attribute names from an AST call/attribute chain (innermost first)."""
+    attrs: List[str] = []
+    current = node
+    # Reasonable recursion guard in case of malformed AST structures
+    for _ in range(64):
+        if isinstance(current, ast.Attribute):
+            attrs.append(current.attr)
+            current = current.value
+            continue
+        if isinstance(current, ast.Call):
+            current = current.func
+            continue
+        break
+    return attrs
+
+
+class PythonOutputExtractor(ast.NodeVisitor):
+    """AST-based extractor for Spark DataFrame write targets in Python files."""
+
+    def __init__(self) -> None:
+        self.constants: Dict[str, str] = {}
+        self.tables: Set[str] = set()
+
+    def _resolve_str(self, node: Optional[ast.AST]) -> Optional[str]:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant):  # Py3.8+
+            if isinstance(node.value, str):
+                return node.value
+            return None
+        if isinstance(node, ast.Str):  # pragma: no cover - Py<3.8 compatibility
+            return node.s
+        if isinstance(node, ast.Name):
+            return self.constants.get(node.id)
+        if isinstance(node, ast.JoinedStr):
+            parts: List[str] = []
+            for value in node.values:
+                if isinstance(value, ast.FormattedValue):
+                    return None
+                sub = self._resolve_str(value)
+                if sub is None:
+                    return None
+                parts.append(sub)
+            return "".join(parts)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = self._resolve_str(node.left)
+            right = self._resolve_str(node.right)
+            if left is not None and right is not None:
+                return left + right
+            return None
+        try:
+            value = ast.literal_eval(node)
+        except Exception:
+            return None
+        return value if isinstance(value, str) else None
+
+    def _add_table(self, raw_value: Optional[str], node: ast.AST) -> None:
+        if not raw_value:
+            return
+        norm = normalize_fqtn(raw_value)
+        if not norm:
+            return
+        if norm not in self.tables:
+            logging.debug(
+                "Detected output table via code (line %s): %s",
+                getattr(node, "lineno", "?"),
+                norm,
+            )
+        self.tables.add(norm)
+
+    def visit_Assign(self, node: ast.Assign) -> None:  # type: ignore[override]
+        value = self._resolve_str(node.value)
+        if value is not None:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.constants[target.id] = value
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # type: ignore[override]
+        if isinstance(node.target, ast.Name):
+            value = self._resolve_str(node.value)
+            if value is not None:
+                self.constants[node.target.id] = value
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:  # type: ignore[override]
+        func = node.func
+        attr = func.attr if isinstance(func, ast.Attribute) else None
+        chain = _collect_attr_chain(func)
+        has_writer = any(a.lower().startswith("write") for a in chain)
+
+        if attr == "insertInto" and has_writer:
+            target = self._resolve_str(node.args[0]) if node.args else None
+            if target is None:
+                for kw in node.keywords:
+                    if kw.arg and kw.arg.lower() in {"table", "tablename"}:
+                        target = self._resolve_str(kw.value)
+                        if target:
+                            break
+            if target:
+                self._add_table(target, node)
+
+        elif attr == "saveAsTable" and has_writer:
+            target = self._resolve_str(node.args[0]) if node.args else None
+            if target is None:
+                for kw in node.keywords:
+                    if kw.arg and kw.arg.lower() in {"table", "tablename"}:
+                        target = self._resolve_str(kw.value)
+                        if target:
+                            break
+            if target:
+                self._add_table(target, node)
+
+        elif attr == "option" and has_writer:
+            key = self._resolve_str(node.args[0]) if node.args else None
+            if key and key.lower() == "table":
+                value = self._resolve_str(node.args[1]) if len(node.args) > 1 else None
+                if value:
+                    self._add_table(value, node)
+            for kw in node.keywords:
+                if kw.arg and kw.arg.lower() == "table":
+                    value = self._resolve_str(kw.value)
+                    if value:
+                        self._add_table(value, node)
+
+        else:
+            if has_writer:
+                for kw in node.keywords:
+                    if kw.arg and kw.arg.lower() in {"table", "tablename"}:
+                        value = self._resolve_str(kw.value)
+                        if value:
+                            self._add_table(value, node)
+
+        self.generic_visit(node)
+
+
+def extract_output_tables_from_python(text: str) -> Set[str]:
+    """Parse Python source code to identify DataFrame write targets."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        logging.debug("Failed to parse Python AST: %s", exc)
+        return set()
+
+    extractor = PythonOutputExtractor()
+    extractor.visit(tree)
+    return extractor.tables
+
+
 def parse_insertinto_targets(text: str) -> Set[str]:
     t = text.lower()
     return {to_fqtn(db, tbl) for db, tbl in RE_INSERT_INTO_L.findall(t)}
@@ -249,14 +400,27 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
         scanned += 1
         ext = os.path.splitext(p)[1].lower()
 
-        outs = parse_output_tables_from_header(text)
+        outs: Set[str] = set()
+
+        if ext == '.py':
+            code_outs = extract_output_tables_from_python(text)
+            if code_outs:
+                logging.info("Code-based outputs in %s: %s", p, ", ".join(sorted(code_outs)))
+            else:
+                logging.debug("No code-based outputs detected in %s; falling back to headers.", p)
+            outs |= code_outs
+            if not code_outs:
+                outs |= parse_output_tables_from_header(text)
+        else:
+            outs |= parse_output_tables_from_header(text)
+
         ins_into = parse_insertinto_targets(text)
         if ins_into:
             logging.debug("insertInto hits in %s: %s", p, ", ".join(sorted(ins_into)))
         outs |= ins_into
 
         if outs:
-            logging.info("Output-section hits in %s: %s", p, ", ".join(sorted(outs)))
+            logging.info("Output-table hits in %s: %s", p, ", ".join(sorted(outs)))
         for fqtn in outs:
             if "." in fqtn:
                 index[fqtn].append(WriterInfo(file_path=p, kind='spark'))
@@ -354,7 +518,16 @@ def find_writers_for_table(
             text = read_text(p)
             if text is None:
                 continue
-            outs = parse_output_tables_from_header(text) | parse_insertinto_targets(text)
+            outs: Set[str] = set()
+            ext = os.path.splitext(p)[1].lower()
+            if ext == '.py':
+                code_outs = extract_output_tables_from_python(text)
+                outs |= code_outs
+                if not code_outs:
+                    outs |= parse_output_tables_from_header(text)
+            else:
+                outs |= parse_output_tables_from_header(text)
+            outs |= parse_insertinto_targets(text)
             if fqtn in outs:
                 writers.append(WriterInfo(file_path=p, kind='spark'))
                 continue

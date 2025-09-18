@@ -17,7 +17,7 @@ Dependency tracer for Spark/SQL pipelines with recursive lineage expansion.
   * "Source Table" is a leaf table that has no upstreams.
 - Emit a flat table with columns: ["Target Table", "Layer 1", ..., "Source Table"].
 
-Author: you
+Author: Wu Tong
 """
 
 import argparse

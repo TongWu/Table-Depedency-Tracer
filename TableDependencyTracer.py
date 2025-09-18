@@ -66,6 +66,14 @@ RE_INSERT_INTO = re.compile(
     r"\.insertInto\(\s*['\"]([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)['\"]\s*,",
 )
 
+# SAS macro parsing helpers (see extract_sas_tables.py for reference)
+RE_SAS_MACRO_ASSIGN = re.compile(
+    r"%let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]*);",
+    re.IGNORECASE,
+)
+RE_SAS_INPUT_MACRO = re.compile(r"_input\d*", re.IGNORECASE)
+RE_SAS_OUTPUT_MACRO = re.compile(r"_output\d*", re.IGNORECASE)
+
 # Word boundary strict search for file prefilter (table name only)
 def word_boundary_pattern(name: str) -> re.Pattern:
     """Build a strict word-boundary regex for a *lower-cased* table name."""
@@ -83,7 +91,7 @@ def normalize_table_only(name: str) -> str:
 class WriterInfo:
     """Represents a script/view that writes a specific output table."""
     file_path: str
-    kind: str  # 'spark' or 'view'
+    kind: str  # 'spark', 'view', or 'sas'
 
 def to_fqtn(db: str, tbl: str) -> str:
     """Build lower-cased fully-qualified table name 'db.tbl'."""
@@ -105,12 +113,12 @@ def word_boundary_pattern_fqtn(fqtn: str) -> re.Pattern:
 # ------------------------------
 
 def list_code_files(root: str) -> List[str]:
-    """List .py and .sql files under root recursively."""
+    """List .py, .sql, and .sas files under root recursively."""
     targets = []
     for base, _, files in os.walk(root):
         for f in files:
             ext = os.path.splitext(f)[1].lower()
-            if ext in ('.py', '.sql'):
+            if ext in ('.py', '.sql', '.sas'):
                 targets.append(os.path.join(base, f))
     return targets
 
@@ -390,6 +398,91 @@ def parse_view_name(text: str) -> Optional[str]:
     return raw  # could be 'db.view' or just 'view'
 
 
+def _sas_sanitize_macro_value(value: str) -> str:
+    """Trim surrounding quotes and whitespace from a SAS macro assignment value."""
+
+    v = value.strip()
+    if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+        v = v[1:-1]
+    return v.strip()
+
+
+def parse_sas_macros(text: str) -> Dict[str, str]:
+    """Return macro assignments keyed by lower-case macro names."""
+
+    macros: Dict[str, str] = {}
+    for match in RE_SAS_MACRO_ASSIGN.finditer(text):
+        name = match.group(1).lower()
+        value = _sas_sanitize_macro_value(match.group(2))
+        macros[name] = value
+    return macros
+
+
+def normalize_sas_dataset(value: str) -> str:
+    """Return a canonical representation of a SAS dataset reference."""
+
+    cleaned = value.strip()
+    cleaned = cleaned.rstrip(";,)")
+    cleaned = cleaned.lstrip("(")
+    return cleaned
+
+
+def _sas_dataset_to_fqtn(value: str) -> Optional[str]:
+    """Convert a SAS dataset reference to lower-case ``schema.table`` when possible."""
+
+    dataset = normalize_sas_dataset(value)
+    if not dataset:
+        return None
+    dataset = dataset.split()[0]  # remove trailing comments or inline notes
+    dataset = dataset.split("(")[0]  # drop option clauses like (where=...)
+    dataset = dataset.strip("'\"")
+    dataset = dataset.rstrip('.')
+    if not dataset or '.' not in dataset:
+        return None
+    return dataset.lower()
+
+
+def extract_lineage_from_sas(text: str) -> Tuple[Set[str], Set[str]]:
+    """Return (inputs, outputs) detected from SAS macro assignments."""
+
+    try:
+        macros = parse_sas_macros(text)
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.debug("Failed to parse SAS macros: %s", exc)
+        return set(), set()
+
+    inputs: List[str] = []
+    seen_inputs: Set[str] = set()
+    for name, value in macros.items():
+        if RE_SAS_INPUT_MACRO.fullmatch(name):
+            fqtn = _sas_dataset_to_fqtn(value)
+            if fqtn and fqtn not in seen_inputs:
+                seen_inputs.add(fqtn)
+                inputs.append(fqtn)
+
+    outputs_by_macro: Dict[str, str] = {}
+    for name, value in macros.items():
+        if RE_SAS_OUTPUT_MACRO.fullmatch(name):
+            fqtn = _sas_dataset_to_fqtn(value)
+            if fqtn:
+                outputs_by_macro[name] = fqtn
+
+    outputs: List[str] = []
+    seen_outputs: Set[str] = set()
+    for macro_name in sorted(outputs_by_macro.keys()):
+        fqtn = outputs_by_macro[macro_name]
+        if fqtn not in seen_outputs:
+            seen_outputs.add(fqtn)
+            outputs.append(fqtn)
+
+    return set(inputs), set(outputs)
+
+
+def extract_upstreams_from_sas(text: str) -> Set[str]:
+    inputs, _ = extract_lineage_from_sas(text)
+    return inputs
+
+
 def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
     index: Dict[str, List[WriterInfo]] = defaultdict(list)
     scanned = 0
@@ -401,6 +494,7 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
         ext = os.path.splitext(p)[1].lower()
 
         outs: Set[str] = set()
+        writer_kind = 'spark'
 
         if ext == '.py':
             code_outs = extract_output_tables_from_python(text)
@@ -411,20 +505,28 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
             outs |= code_outs
             if not code_outs:
                 outs |= parse_output_tables_from_header(text)
+        elif ext == '.sas':
+            sas_inputs, sas_outputs = extract_lineage_from_sas(text)
+            if sas_outputs:
+                logging.info("SAS outputs in %s: %s", p, ", ".join(sorted(sas_outputs)))
+            if sas_inputs:
+                logging.debug("SAS inputs in %s: %s", p, ", ".join(sorted(sas_inputs)))
+            outs |= sas_outputs
+            writer_kind = 'sas'
         else:
             outs |= parse_output_tables_from_header(text)
 
-        ins_into = parse_insertinto_targets(text)
-        if ins_into:
-            logging.debug("insertInto hits in %s: %s", p, ", ".join(sorted(ins_into)))
-        outs |= ins_into
+        if ext != '.sas':
+            ins_into = parse_insertinto_targets(text)
+            if ins_into:
+                logging.debug("insertInto hits in %s: %s", p, ", ".join(sorted(ins_into)))
+            outs |= ins_into
 
         if outs:
             logging.info("Output-table hits in %s: %s", p, ", ".join(sorted(outs)))
         for fqtn in outs:
             if "." in fqtn:
-                index[fqtn].append(WriterInfo(file_path=p, kind='spark'))
-                #logging.info("Indexed Spark writer: %s -> %s", fqtn, p)
+                index[fqtn].append(WriterInfo(file_path=p, kind=writer_kind))
 
         if ext == '.sql':
             v = parse_view_name(text)  # lower-cased; may be bare
@@ -470,6 +572,8 @@ def get_upstreams_for_writer(writer: WriterInfo) -> Set[str]:
         return extract_upstreams_from_spark(text)
     elif writer.kind == 'view':
         return extract_upstreams_from_view(text)
+    elif writer.kind == 'sas':
+        return extract_upstreams_from_sas(text)
     else:
         return set()
 
@@ -520,20 +624,27 @@ def find_writers_for_table(
                 continue
             outs: Set[str] = set()
             ext = os.path.splitext(p)[1].lower()
+            writer_kind = 'spark'
             if ext == '.py':
                 code_outs = extract_output_tables_from_python(text)
                 outs |= code_outs
                 if not code_outs:
                     outs |= parse_output_tables_from_header(text)
+                outs |= parse_insertinto_targets(text)
+            elif ext == '.sas':
+                _, sas_outputs = extract_lineage_from_sas(text)
+                outs |= sas_outputs
+                writer_kind = 'sas'
             else:
                 outs |= parse_output_tables_from_header(text)
-            outs |= parse_insertinto_targets(text)
+                outs |= parse_insertinto_targets(text)
             if fqtn in outs:
-                writers.append(WriterInfo(file_path=p, kind='spark'))
+                writers.append(WriterInfo(file_path=p, kind=writer_kind))
                 continue
-            v = parse_view_name(text)
-            if v == fqtn:
-                writers.append(WriterInfo(file_path=p, kind='view'))
+            if ext == '.sql':
+                v = parse_view_name(text)
+                if v == fqtn:
+                    writers.append(WriterInfo(file_path=p, kind='view'))
 
     uniq = {(w.file_path, w.kind): w for w in writers}
     deduped = list(uniq.values())

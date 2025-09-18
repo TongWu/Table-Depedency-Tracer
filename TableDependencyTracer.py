@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Dependency tracer for Spark/SQL pipelines with recursive lineage expansion.
+Dependency tracer for Spark/SQL/SAS pipelines with recursive lineage expansion.
 
 - Strict case-sensitive match on table names.
-- Crawl .py and .sql files under a given root (including subfolders).
+- Crawl .py, .sql, and .sas files under a given root (including subfolders).
 - Determine writers:
   * Spark ETL: parse header "Output table(s):" to find fully-qualified output tables.
   * VIEW SQL: parse "CREATE VIEW <db>.<view>" or "CREATE VIEW <view>" to map view -> file.
+  * SAS: parse %LET _OUTPUT* macros to find fully-qualified datasets written by the job.
 - Determine upstreams:
   * Spark ETL: regex on spark.table('db.tbl') → upstream table names (use table name only).
   * VIEW SQL: regex on FROM/JOIN db.tbl → upstream tables (use table name only).
+  * SAS: parse %LET _INPUT* macros → upstream datasets.
 - Build lineage paths: For each target, enumerate all paths to sources.
   * "Layer i" columns contain tables that still have upstreams.
   * "Source Table" is a leaf table that has no upstreams.
@@ -83,7 +85,7 @@ def normalize_table_only(name: str) -> str:
 class WriterInfo:
     """Represents a script/view that writes a specific output table."""
     file_path: str
-    kind: str  # 'spark' or 'view'
+    kind: str  # 'spark', 'view', or 'sas'
 
 def to_fqtn(db: str, tbl: str) -> str:
     """Build lower-cased fully-qualified table name 'db.tbl'."""
@@ -101,16 +103,76 @@ def word_boundary_pattern_fqtn(fqtn: str) -> re.Pattern:
 
 
 # ------------------------------
+# SAS parsing helpers
+# ------------------------------
+
+RE_SAS_MACRO_ASSIGN = re.compile(r"%let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]*);", re.IGNORECASE)
+RE_SAS_INPUT_MACRO = re.compile(r"_input\d*$")
+RE_SAS_OUTPUT_MACRO = re.compile(r"_output\d*$")
+
+
+def _sanitize_sas_macro_value(value: str) -> str:
+    """Trim surrounding quotes and whitespace from a SAS macro value."""
+
+    v = value.strip()
+    if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+        v = v[1:-1]
+    return v.strip()
+
+
+def _normalize_sas_dataset(value: str) -> str:
+    """Return dataset reference without trailing punctuation."""
+
+    v = value.strip()
+    v = v.rstrip(";,)")
+    v = v.lstrip("(")
+    return v.strip()
+
+
+def parse_sas_macros(text: str) -> Dict[str, str]:
+    """Return SAS macro assignments keyed by lower-cased names."""
+
+    macros: Dict[str, str] = {}
+    for match in RE_SAS_MACRO_ASSIGN.finditer(text):
+        name = match.group(1).lower()
+        value = _sanitize_sas_macro_value(match.group(2))
+        macros[name] = value
+    return macros
+
+
+def extract_sas_lineage(text: str) -> Tuple[Set[str], Set[str]]:
+    """Return (inputs, outputs) detected from SAS macro assignments."""
+
+    macros = parse_sas_macros(text)
+    inputs: Set[str] = set()
+    outputs: Set[str] = set()
+
+    for name, raw in macros.items():
+        dataset = _normalize_sas_dataset(raw)
+        if not dataset:
+            continue
+        norm = normalize_fqtn(dataset)
+        if not norm:
+            continue
+        if RE_SAS_INPUT_MACRO.fullmatch(name):
+            inputs.add(norm)
+        elif RE_SAS_OUTPUT_MACRO.fullmatch(name):
+            outputs.add(norm)
+
+    return inputs, outputs
+
+
+# ------------------------------
 # File scanning & indexing
 # ------------------------------
 
 def list_code_files(root: str) -> List[str]:
-    """List .py and .sql files under root recursively."""
+    """List .py, .sql, and .sas files under root recursively."""
     targets = []
     for base, _, files in os.walk(root):
         for f in files:
             ext = os.path.splitext(f)[1].lower()
-            if ext in ('.py', '.sql'):
+            if ext in ('.py', '.sql', '.sas'):
                 targets.append(os.path.join(base, f))
     return targets
 
@@ -411,6 +473,17 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
             outs |= code_outs
             if not code_outs:
                 outs |= parse_output_tables_from_header(text)
+        elif ext == '.sas':
+            sas_inputs, sas_outs = extract_sas_lineage(text)
+            if sas_outs:
+                logging.info("SAS outputs in %s: %s", p, ", ".join(sorted(sas_outs)))
+            else:
+                logging.debug("No SAS outputs detected in %s; falling back to headers.", p)
+            if sas_inputs:
+                logging.debug("SAS inputs in %s: %s", p, ", ".join(sorted(sas_inputs)))
+            outs |= sas_outs
+            if not sas_outs:
+                outs |= parse_output_tables_from_header(text)
         else:
             outs |= parse_output_tables_from_header(text)
 
@@ -423,8 +496,9 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
             logging.info("Output-table hits in %s: %s", p, ", ".join(sorted(outs)))
         for fqtn in outs:
             if "." in fqtn:
-                index[fqtn].append(WriterInfo(file_path=p, kind='spark'))
-                #logging.info("Indexed Spark writer: %s -> %s", fqtn, p)
+                kind = 'sas' if ext == '.sas' else 'spark'
+                index[fqtn].append(WriterInfo(file_path=p, kind=kind))
+                #logging.info("Indexed %s writer: %s -> %s", kind, fqtn, p)
 
         if ext == '.sql':
             v = parse_view_name(text)  # lower-cased; may be bare
@@ -461,6 +535,11 @@ def extract_upstreams_from_view(text: str) -> Set[str]:
     t = text.lower()
     return {to_fqtn(db, tbl) for db, tbl in RE_FROM_JOIN_L.findall(t)}
 
+
+def extract_upstreams_from_sas(text: str) -> Set[str]:
+    inputs, _ = extract_sas_lineage(text)
+    return inputs
+
 def get_upstreams_for_writer(writer: WriterInfo) -> Set[str]:
     """Read file and dispatch to appropriate extractor."""
     text = read_text(writer.file_path)
@@ -470,6 +549,8 @@ def get_upstreams_for_writer(writer: WriterInfo) -> Set[str]:
         return extract_upstreams_from_spark(text)
     elif writer.kind == 'view':
         return extract_upstreams_from_view(text)
+    elif writer.kind == 'sas':
+        return extract_upstreams_from_sas(text)
     else:
         return set()
 
@@ -525,15 +606,22 @@ def find_writers_for_table(
                 outs |= code_outs
                 if not code_outs:
                     outs |= parse_output_tables_from_header(text)
+            elif ext == '.sas':
+                _, sas_outs = extract_sas_lineage(text)
+                outs |= sas_outs
+                if not sas_outs:
+                    outs |= parse_output_tables_from_header(text)
             else:
                 outs |= parse_output_tables_from_header(text)
             outs |= parse_insertinto_targets(text)
             if fqtn in outs:
-                writers.append(WriterInfo(file_path=p, kind='spark'))
+                kind = 'sas' if ext == '.sas' else 'spark'
+                writers.append(WriterInfo(file_path=p, kind=kind))
                 continue
-            v = parse_view_name(text)
-            if v == fqtn:
-                writers.append(WriterInfo(file_path=p, kind='view'))
+            if ext == '.sql':
+                v = parse_view_name(text)
+                if v == fqtn:
+                    writers.append(WriterInfo(file_path=p, kind='view'))
 
     uniq = {(w.file_path, w.kind): w for w in writers}
     deduped = list(uniq.values())
@@ -678,7 +766,7 @@ def write_csv(rows: List[Dict[str, str]], out_path: str) -> None:
 
 def tracer():
     parser = argparse.ArgumentParser(description="Recursive lineage tracer for Spark/SQL codebase (FQTN-aware).")
-    parser.add_argument("--root", required=True, help="Root folder to scan (.py/.sql recursively).")
+    parser.add_argument("--root", required=True, help="Root folder to scan (.py/.sql/.sas recursively).")
     parser.add_argument(
         "--targets",
         required=False,
@@ -698,7 +786,7 @@ def tracer():
     logging.info("Scanning files under: %s", args.root)
     debug_scan_output_headers(args.root)
     files = list_code_files(args.root)
-    logging.info("Found %d candidate files (.py/.sql).", len(files))
+    logging.info("Found %d candidate files (.py/.sql/.sas).", len(files))
 
     logging.info("Indexing writers from headers / CREATE VIEW...")
     writers_index = index_writers(files)

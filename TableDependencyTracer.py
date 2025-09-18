@@ -32,10 +32,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, Optional
 
-from extract_sas_tables import (
-    normalize_dataset as normalize_sas_dataset,
-    parse_macros as parse_sas_macros,
-)
+from extract_sas_tables import normalize_dataset as normalize_sas_dataset
 
 # ------------------------------
 # Regexes (case-insensitive for SQL verbs, case-sensitive for identifiers)
@@ -65,6 +62,9 @@ RE_INSERT_INTO_L = re.compile(r"\.insertinto\(\s*['\"]([a-z0-9_]+)\.([a-z0-9_]+)
 
 # Safer per-line alternative if big block fails: lines starting with '#   schema.table'
 RE_OUTPUT_LINE = re.compile(r"^#\s+([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*$", re.MULTILINE)
+
+# SAS macro assignments (e.g. %let _INPUT1 = lib.table;)
+RE_SAS_MACRO_ASSIGN = re.compile(r"%let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]*);", re.IGNORECASE)
 
 # FROM/JOIN sources in SQL (db.tbl). Keep case-sensitive match for identifiers by post-check.
 RE_FROM_JOIN = re.compile(
@@ -116,6 +116,26 @@ def word_boundary_pattern_fqtn(fqtn: str) -> re.Pattern:
     return re.compile(rf"\b{pat}\b")
 
 
+def _sanitize_sas_macro_value(value: str) -> str:
+    """Trim whitespace and surrounding quotes from a SAS macro value."""
+
+    v = value.strip()
+    if (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+        v = v[1:-1]
+    return v.strip()
+
+
+def _iter_sas_macro_assignments(text: str) -> List[Tuple[str, str]]:
+    """Return a list of (macro_name, value) assignments in source order."""
+
+    assignments: List[Tuple[str, str]] = []
+    for match in RE_SAS_MACRO_ASSIGN.finditer(text):
+        name = match.group(1).lower()
+        value = _sanitize_sas_macro_value(match.group(2))
+        assignments.append((name, value))
+    return assignments
+
+
 def _normalize_sas_fqtn(raw_value: str) -> Optional[str]:
     """Return normalized Spark-style FQTN for a SAS dataset reference."""
 
@@ -134,18 +154,16 @@ def _normalize_sas_fqtn(raw_value: str) -> Optional[str]:
 def extract_sas_lineage(text: str) -> Tuple[Set[str], Set[str]]:
     """Return (inputs, outputs) detected from SAS macro assignments."""
 
-    macros = parse_sas_macros(text)
+    assignments = _iter_sas_macro_assignments(text)
     inputs: Set[str] = set()
     outputs: Set[str] = set()
 
-    for name, value in macros.items():
+    for name, value in assignments:
         if re.fullmatch(r"_input\d*", name):
             fqtn = _normalize_sas_fqtn(value)
             if fqtn:
                 inputs.add(fqtn)
-
-    for name, value in macros.items():
-        if re.fullmatch(r"_output\d*", name):
+        elif re.fullmatch(r"_output\d*", name):
             fqtn = _normalize_sas_fqtn(value)
             if fqtn:
                 outputs.add(fqtn)

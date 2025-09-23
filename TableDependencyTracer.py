@@ -24,10 +24,12 @@ Author: Wu Tong
 
 import argparse
 import ast
+import io
 import logging
 import os
 import re
 import sys
+import tokenize
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, Optional
@@ -116,6 +118,35 @@ def normalize_table_only(name: str) -> str:
     """Return table-only part in LOWER CASE (drop db if present)."""
     base = name.split('.', 1)[1] if '.' in name else name
     return base.lower()
+
+
+def strip_python_comments(text: str) -> str:
+    """Return Python source with ``#`` comments removed."""
+
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, IndentationError):
+        return text
+
+    filtered = [tok for tok in tokens if tok.type != tokenize.COMMENT]
+    try:
+        return tokenize.untokenize(filtered)
+    except Exception:
+        return text
+
+
+def log_progress(label: str, current: int, total: int, last_logged: int, step_percent: int = 10) -> int:
+    """Log progress for a long-running loop and return the updated checkpoint."""
+
+    if total <= 0:
+        return last_logged
+
+    threshold = max(1, total * step_percent // 100)
+    if current == total or current - last_logged >= threshold:
+        percent = (current / total) * 100 if total else 100.0
+        logging.info("%s progress: %d/%d (%.1f%%)", label, current, total, percent)
+        return current
+    return last_logged
 
 
 
@@ -546,12 +577,16 @@ def parse_view_name(text: str) -> Optional[str]:
 def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
     index: Dict[str, List[WriterInfo]] = defaultdict(list)
     scanned = 0
-    for p in files:
+    total_files = len(files)
+    last_progress = 0
+    for idx, p in enumerate(files, start=1):
         text = read_text(p)
         if text is None:
+            last_progress = log_progress("Indexing writers", idx, total_files, last_progress)
             continue
         scanned += 1
         ext = os.path.splitext(p)[1].lower()
+        sanitized_text = strip_python_comments(text) if ext == '.py' else text
 
         detected_outputs: Dict[str, str] = {}
 
@@ -582,7 +617,7 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
             for fqtn in header_outs:
                 detected_outputs.setdefault(fqtn, 'spark')
 
-        ins_into = parse_insertinto_targets(text)
+        ins_into = parse_insertinto_targets(sanitized_text)
         if ins_into:
             logging.debug("insertInto hits in %s: %s", p, ", ".join(sorted(ins_into)))
             for fqtn in ins_into:
@@ -603,6 +638,8 @@ def index_writers(files: List[str]) -> Dict[str, List[WriterInfo]]:
             if v and "." in v:
                 index[v].append(WriterInfo(file_path=p, kind='view'))
                 #logging.info("Indexed View writer: %s -> %s", v, p)
+
+        last_progress = log_progress("Indexing writers", idx, total_files, last_progress)
 
     logging.info("Indexing done. Scanned %d files. Indexed %d distinct output FQTN(s).",
                  scanned, len(index))
@@ -638,8 +675,10 @@ def get_upstreams_for_writer(writer: WriterInfo) -> Set[str]:
     text = read_text(writer.file_path)
     if text is None:
         return set()
+    ext = os.path.splitext(writer.file_path)[1].lower()
+    sanitized_text = strip_python_comments(text) if ext == '.py' else text
     if writer.kind == 'spark':
-        return extract_upstreams_from_spark(text)
+        return extract_upstreams_from_spark(sanitized_text)
     elif writer.kind == 'view':
         return extract_upstreams_from_view(text)
     elif writer.kind == 'sas':
@@ -663,7 +702,9 @@ def filter_candidate_files_by_name(files: List[str], fqtn: str) -> List[str]:
         text = read_text(p)
         if text is None:
             continue
-        if pat.search(text.lower()):
+        ext = os.path.splitext(p)[1].lower()
+        searchable_text = strip_python_comments(text) if ext == '.py' else text
+        if pat.search(searchable_text.lower()):
             out.append(p)
     return out
 
@@ -703,6 +744,7 @@ def find_writers_for_table(
             if text is None:
                 continue
             ext = os.path.splitext(p)[1].lower()
+            sanitized_text = strip_python_comments(text) if ext == '.py' else text
             if ext == '.sas':
                 _, sas_outputs = extract_sas_lineage(text)
                 if any(name in sas_outputs for name in lookup_names):
@@ -716,7 +758,7 @@ def find_writers_for_table(
                     outs |= parse_output_tables_from_header(text)
             else:
                 outs |= parse_output_tables_from_header(text)
-            outs |= parse_insertinto_targets(text)
+            outs |= parse_insertinto_targets(sanitized_text)
             if any(name in outs for name in lookup_names):
                 writers.append(WriterInfo(file_path=p, kind='spark'))
                 continue
@@ -949,12 +991,15 @@ def tracer():
 
     # 4) Run DFS for each target FQTN and write rows
     all_rows: List[Dict[str, str]] = []
-    for tgt_fqtn in fqtn_targets:
-        logging.info("=== Start lineage for target: %s ===", tgt_fqtn)
+    total_targets = len(fqtn_targets)
+    target_progress = 0
+    for idx, tgt_fqtn in enumerate(fqtn_targets, start=1):
+        logging.info("=== [%d/%d] Start lineage for target: %s ===", idx, total_targets, tgt_fqtn)
         paths = dfs_lineage_paths(tgt_fqtn, files, writers_index)
         rows = shape_paths_to_rows(tgt_fqtn, paths)  # paths contain FQTN at each hop
         all_rows.extend(rows)
-        logging.info("=== Done lineage for target: %s (paths=%d) ===", tgt_fqtn, len(paths))
+        logging.info("=== [%d/%d] Done lineage for target: %s (paths=%d) ===", idx, total_targets, tgt_fqtn, len(paths))
+        target_progress = log_progress("Lineage expansion", idx, total_targets, target_progress)
 
     write_csv(all_rows, args.out)
 

@@ -783,7 +783,8 @@ def dfs_lineage_paths(
     all_files: List[str],
     writers_index: Dict[str, List[WriterInfo]],
     visited_stack: Optional[List[str]] = None,
-    cache_upstreams: Optional[Dict[str, Set[str]]] = None
+    cache_upstreams: Optional[Dict[str, Set[str]]] = None,
+    cache_paths: Optional[Dict[str, List[List[str]]]] = None,
 ) -> List[List[str]]:
     """
     Depth-first enumerate all lineage paths from a fully-qualified table (FQTN: db.tbl) to sources.
@@ -792,11 +793,16 @@ def dfs_lineage_paths(
     - A node has upstreams if there exists >=1 writer and those writer files reference upstream FQTN(s).
     - If no writers or upstream set is empty, the node is treated as a source.
     - Cycle-safe via 'visited_stack' (FQTN-based).
+    - ``cache_upstreams`` memoises the immediate upstream sets for each table.
+    - ``cache_paths`` memoises the full lineage paths for each table so repeated lookups reuse the
+      previously computed dependency tree.
     """
     if visited_stack is None:
         visited_stack = []
     if cache_upstreams is None:
         cache_upstreams = {}
+    if cache_paths is None:
+        cache_paths = {}
 
     # Normalize to lower-case FQTN just in case upstream callers didn't
     start_fqtn = start_fqtn.lower()
@@ -805,6 +811,16 @@ def dfs_lineage_paths(
     if start_fqtn in visited_stack:
         logging.warning("Cycle detected at %s. Cutting branch.", start_fqtn)
         return [[start_fqtn]]  # cut the branch at the cycle
+
+    # Full-path memoization
+    if start_fqtn in cache_paths:
+        cached_paths = cache_paths[start_fqtn]
+        logging.debug(
+            "Lineage cache hit for %s -> %d path(s)",
+            start_fqtn,
+            len(cached_paths),
+        )
+        return [path[:] for path in cached_paths]
 
     # Find writers for this FQTN
     writers = find_writers_for_table(start_fqtn, all_files, writers_index)
@@ -824,7 +840,8 @@ def dfs_lineage_paths(
     # No upstreams ⇒ treat as source
     if not writers or len(upstream_union) == 0:
         logging.info("Table '%s' has no upstreams. Treat as source.", start_fqtn)
-        return [[start_fqtn]]
+        cache_paths[start_fqtn] = [[start_fqtn]]
+        return [path[:] for path in cache_paths[start_fqtn]]
 
     # Branch on each upstream FQTN
     all_paths: List[List[str]] = []
@@ -832,11 +849,13 @@ def dfs_lineage_paths(
         subpaths = dfs_lineage_paths(
             up_fqtn, all_files, writers_index,
             visited_stack=visited_stack + [start_fqtn],
-            cache_upstreams=cache_upstreams
+            cache_upstreams=cache_upstreams,
+            cache_paths=cache_paths
         )
         for sp in subpaths:
             all_paths.append([start_fqtn] + sp)
-    return all_paths
+    cache_paths[start_fqtn] = [path[:] for path in all_paths]
+    return [path[:] for path in cache_paths[start_fqtn]]
 
 
 # ------------------------------
@@ -993,9 +1012,17 @@ def tracer():
     all_rows: List[Dict[str, str]] = []
     total_targets = len(fqtn_targets)
     target_progress = 0
+    global_upstream_cache: Dict[str, Set[str]] = {}
+    global_path_cache: Dict[str, List[List[str]]] = {}
     for idx, tgt_fqtn in enumerate(fqtn_targets, start=1):
         logging.info("=== [%d/%d] Start lineage for target: %s ===", idx, total_targets, tgt_fqtn)
-        paths = dfs_lineage_paths(tgt_fqtn, files, writers_index)
+        paths = dfs_lineage_paths(
+            tgt_fqtn,
+            files,
+            writers_index,
+            cache_upstreams=global_upstream_cache,
+            cache_paths=global_path_cache,
+        )
         rows = shape_paths_to_rows(tgt_fqtn, paths)  # paths contain FQTN at each hop
         all_rows.extend(rows)
         logging.info("=== [%d/%d] Done lineage for target: %s (paths=%d) ===", idx, total_targets, tgt_fqtn, len(paths))

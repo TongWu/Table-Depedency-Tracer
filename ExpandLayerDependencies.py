@@ -129,7 +129,7 @@ def _extract_layer_columns(fieldnames: Sequence[str]) -> List[str]:
 
 
 def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) -> List[Dict[str, str]]:
-    """Return rows plus new rows for each intermediate layer table (appended to the bottom)."""
+    """Return rows plus new rows for each intermediate layer table, grouped by target table."""
 
     if not rows:
         LOGGER.info("Input CSV is empty. Nothing to expand.")
@@ -146,12 +146,13 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
         if _normalise_value(row.get(TARGET_COLUMN))
     }
 
-    expanded: List[Dict[str, str]] = []
-    new_rows: List[Dict[str, str]] = []
+    grouped_rows = {}
 
     for original in rows:
-        # Preserve the original row.
-        expanded.append(dict(original))
+        target_value = _normalise_value(original.get(TARGET_COLUMN))
+        if not target_value:
+            continue
+        grouped_rows.setdefault(target_value, []).append(dict(original))
 
         for idx, layer in enumerate(layer_columns):
             layer_value = _normalise_value(original.get(layer))
@@ -174,10 +175,22 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
             if source_value:
                 new_row[SOURCE_COLUMN] = source_value
 
-            new_rows.append(new_row)
+            grouped_rows.setdefault(layer_value, []).append(new_row)
             LOGGER.debug("Added exploded row for layer '%s'", layer_value)
 
-    expanded.extend(new_rows)
+    ordered_targets = []
+    for original in rows:
+        target_value = _normalise_value(original.get(TARGET_COLUMN))
+        if target_value and target_value not in ordered_targets:
+            ordered_targets.append(target_value)
+    for target in grouped_rows:
+        if target not in ordered_targets:
+            ordered_targets.append(target)
+
+    expanded = []
+    for target in ordered_targets:
+        expanded.extend(grouped_rows[target])
+
     return expanded
 
 

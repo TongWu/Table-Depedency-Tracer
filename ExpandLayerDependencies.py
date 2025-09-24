@@ -129,7 +129,7 @@ def _extract_layer_columns(fieldnames: Sequence[str]) -> List[str]:
 
 
 def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) -> List[Dict[str, str]]:
-    """Return rows plus new rows for each intermediate layer table."""
+    """Return rows plus new rows for each intermediate layer table (appended to the bottom)."""
 
     if not rows:
         LOGGER.info("Input CSV is empty. Nothing to expand.")
@@ -147,6 +147,8 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
     }
 
     expanded: List[Dict[str, str]] = []
+    new_rows: List[Dict[str, str]] = []
+
     for original in rows:
         # Preserve the original row.
         expanded.append(dict(original))
@@ -172,9 +174,10 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
             if source_value:
                 new_row[SOURCE_COLUMN] = source_value
 
-            expanded.append(new_row)
+            new_rows.append(new_row)
             LOGGER.debug("Added exploded row for layer '%s'", layer_value)
 
+    expanded.extend(new_rows)
     return expanded
 
 

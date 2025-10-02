@@ -128,6 +128,27 @@ def _extract_layer_columns(fieldnames: Sequence[str]) -> List[str]:
     return [name for _, name in layers]
 
 
+def _deduplicate_rows(
+    rows: Sequence[Dict[str, str]], fieldnames: Sequence[str]
+) -> List[Dict[str, str]]:
+    """Return ``rows`` with duplicate entries removed while preserving order.
+
+    ``fieldnames`` defines the comparison order so that two rows are considered
+    identical when every column value matches (after normalisation).  The first
+    occurrence is kept and subsequent duplicates are discarded.
+    """
+
+    seen = set()
+    unique_rows: List[Dict[str, str]] = []
+    for row in rows:
+        key = tuple(_normalise_value(row.get(name)) for name in fieldnames)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    return unique_rows
+
+
 def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) -> List[Dict[str, str]]:
     """Return rows plus new rows for each intermediate layer table, grouped by target table."""
 
@@ -212,15 +233,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         _write_csv(args.output, rows, original_fieldnames)
         return
 
-    expanded_rows = expand_rows(rows, layer_columns)
     fieldnames = original_fieldnames or [TARGET_COLUMN, *layer_columns, SOURCE_COLUMN]
+    expanded_rows = expand_rows(rows, layer_columns)
+    deduplicated_rows = _deduplicate_rows(expanded_rows, fieldnames)
     LOGGER.info(
         "Expanded %d original rows into %d rows (added %d exploded rows)",
         len(rows),
         len(expanded_rows),
         len(expanded_rows) - len(rows),
     )
-    _write_csv(args.output, expanded_rows, fieldnames)
+    if len(deduplicated_rows) != len(expanded_rows):
+        LOGGER.info(
+            "Removed %d duplicate rows after expansion",
+            len(expanded_rows) - len(deduplicated_rows),
+        )
+    _write_csv(args.output, deduplicated_rows, fieldnames)
 
 
 if __name__ == "__main__":

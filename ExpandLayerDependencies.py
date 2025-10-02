@@ -194,6 +194,24 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
     return expanded
 
 
+def _deduplicate_rows(
+    rows: Sequence[Dict[str, str]], fieldnames: Sequence[str]
+) -> List[Dict[str, str]]:
+    """Return ``rows`` with duplicate full-row entries removed, preserving order."""
+
+    seen: set[tuple[str, ...]] = set()
+    deduplicated: List[Dict[str, str]] = []
+
+    for row in rows:
+        key = tuple(_normalise_value(row.get(column)) for column in fieldnames)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(row)
+
+    return deduplicated
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s: %(message)s")
@@ -212,8 +230,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         _write_csv(args.output, rows, original_fieldnames)
         return
 
-    expanded_rows = expand_rows(rows, layer_columns)
     fieldnames = original_fieldnames or [TARGET_COLUMN, *layer_columns, SOURCE_COLUMN]
+    expanded_rows = expand_rows(rows, layer_columns)
+    deduplicated_rows = _deduplicate_rows(expanded_rows, fieldnames)
+    if len(deduplicated_rows) != len(expanded_rows):
+        LOGGER.info(
+            "Removed %d duplicate rows after expansion",
+            len(expanded_rows) - len(deduplicated_rows),
+        )
+        expanded_rows = deduplicated_rows
     LOGGER.info(
         "Expanded %d original rows into %d rows (added %d exploded rows)",
         len(rows),

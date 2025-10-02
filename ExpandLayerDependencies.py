@@ -145,6 +145,12 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
         for row in rows
         if _normalise_value(row.get(TARGET_COLUMN))
     }
+    # Track every value that has appeared in the target column (original or
+    # promoted) so that we can avoid re-expanding the same table multiple
+    # times.  A large lineage file may reference the same intermediate layer in
+    # many rows; short-circuiting here prevents the script from emitting
+    # identical exploded rows repeatedly.
+    seen_targets = set(base_targets)
 
     grouped_rows = {}
 
@@ -158,8 +164,11 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
             layer_value = _normalise_value(original.get(layer))
             if not layer_value:
                 continue
-            if layer_value in base_targets:
-                LOGGER.debug("Skip layer '%s' because it already exists as a target", layer_value)
+            if layer_value in seen_targets:
+                LOGGER.debug(
+                    "Skip layer '%s' because it already exists in the target column",
+                    layer_value,
+                )
                 continue
 
             new_row: Dict[str, str] = {TARGET_COLUMN: layer_value}
@@ -176,6 +185,7 @@ def expand_rows(rows: Sequence[Dict[str, str]], layer_columns: Sequence[str]) ->
                 new_row[SOURCE_COLUMN] = source_value
 
             grouped_rows.setdefault(layer_value, []).append(new_row)
+            seen_targets.add(layer_value)
             LOGGER.debug("Added exploded row for layer '%s'", layer_value)
 
     ordered_targets = []
